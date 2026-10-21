@@ -1991,6 +1991,81 @@ try bash "$DS_ROOT_DIR/install.sh" --prefix "$SKILLS" --uninstall -q
 assert_rc "install.sh --uninstall exits 0" 0 "$RC"
 assert_eq "install.sh --uninstall removes everything it installed" "" "$(ls -A "$SKILLS")"
 
+# Versions 1.0 and 1.1 used a real directory with links to each source item.
+# Keep that layout in the fixture so a whole-directory symlink cannot mask a
+# regression in marker validation.
+LEGACY_SOURCE="$TMPDIR_T/legacy-source"
+mkdir -p "$LEGACY_SOURCE/scripts"
+cp "$DS_ROOT_DIR/SKILL.md" "$LEGACY_SOURCE/SKILL.md"
+printf 'keep the checkout\n' >"$LEGACY_SOURCE/scripts/sentinel"
+
+# Build the on-disk layout written by the old symlink-mode installer.
+make_legacy_install() {
+	local dest version
+	dest="$1"
+	version="$2"
+	mkdir -p "$dest"
+	ln -s "$LEGACY_SOURCE/SKILL.md" "$dest/SKILL.md"
+	ln -s "$LEGACY_SOURCE/scripts" "$dest/scripts"
+	printf 'skill=domain-search\nsource=%s\nmode=symlink\ninstaller=%s\n' \
+		"$LEGACY_SOURCE" "$version" >"$dest/.domainsaver-install"
+}
+
+for legacy_version in 1.0.0 1.1.0; do
+	for upgrade_mode in symlink copy; do
+		LEGACY_SKILLS="$TMPDIR_T/legacy-$legacy_version-$upgrade_mode"
+		make_legacy_install "$LEGACY_SKILLS/domain-search" "$legacy_version"
+		try bash "$DS_ROOT_DIR/install.sh" --prefix "$LEGACY_SKILLS" -q
+		assert_rc "$legacy_version upgrade still requires explicit replacement" 1 "$RC"
+		assert_contains "$legacy_version symlink marker is recognised" \
+			"It looks like an existing DomainSaver install" "$ERR"
+		assert_file "refused $legacy_version upgrade preserves its marker" \
+			"$LEGACY_SKILLS/domain-search/.domainsaver-install"
+
+		try bash "$DS_ROOT_DIR/install.sh" --prefix "$LEGACY_SKILLS" "--$upgrade_mode" --force -q
+		assert_rc "$legacy_version upgrades to $upgrade_mode mode" 0 "$RC"
+		if [ "$upgrade_mode" = symlink ]; then
+			assert_eq "legacy upgrade links the whole skill to the current checkout" \
+				"$DS_ROOT_DIR" "$(readlink "$LEGACY_SKILLS/domain-search")"
+		else
+			assert_contains "legacy upgrade writes a copy marker" "mode=copy" \
+				"$(cat "$LEGACY_SKILLS/domain-search/.domainsaver-install")"
+		fi
+		assert_file "$legacy_version upgrade preserves the old source files" \
+			"$LEGACY_SOURCE/scripts/sentinel"
+	done
+
+	LEGACY_SKILLS="$TMPDIR_T/legacy-$legacy_version-uninstall"
+	make_legacy_install "$LEGACY_SKILLS/domain-search" "$legacy_version"
+	try bash "$DS_ROOT_DIR/install.sh" --prefix "$LEGACY_SKILLS" --uninstall -q
+	assert_rc "$legacy_version symlink install uninstalls without force" 0 "$RC"
+	assert_eq "$legacy_version uninstall removes the installation directory" \
+		"" "$(ls -A "$LEGACY_SKILLS")"
+	assert_file "$legacy_version uninstall preserves the linked source files" \
+		"$LEGACY_SOURCE/scripts/sentinel"
+	assert_file "$legacy_version uninstall preserves the linked skill" \
+		"$LEGACY_SOURCE/SKILL.md"
+done
+
+# Accepting legacy markers must not weaken ownership checks for other files.
+INVALID_SKILLS="$TMPDIR_T/invalid-marker-skills"
+mkdir -p "$INVALID_SKILLS/domain-search"
+printf 'keep me\n' >"$INVALID_SKILLS/domain-search/user-file"
+for invalid_marker in \
+	'mode=symlink' \
+	'skill=another-skill|mode=symlink' \
+	'skill=domain-search-extra|mode=symlink' \
+	'skill=domain-search' \
+	'skill=domain-search|mode=unknown' \
+	'skill=domain-search|mode=symlink-extra'; do
+	printf '%s\n' "$invalid_marker" | tr '|' '\n' \
+		>"$INVALID_SKILLS/domain-search/.domainsaver-install"
+	try bash "$DS_ROOT_DIR/install.sh" --prefix "$INVALID_SKILLS" --uninstall -q
+	assert_rc "uninstall rejects invalid marker: $invalid_marker" 1 "$RC"
+	assert_file "invalid marker leaves user files untouched: $invalid_marker" \
+		"$INVALID_SKILLS/domain-search/user-file"
+done
+
 # A skill name is public metadata, not an ownership marker. An unrelated real
 # directory must survive uninstall even if its SKILL.md uses the same name and
 # it contains a file with the install marker's filename.

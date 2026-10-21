@@ -82,8 +82,6 @@ Sleep 2500ms
 Type "# Original work: Jon Hammant + Claude" Enter
 Sleep 1600ms
 Type "# github.com/jhammant/DomainSaver" Enter
-Sleep 1600ms
-Type "# Codex port: github.com/stephenlclarke/DomainSaver" Enter
 Sleep 3s
 
 # ---------------------------------------------------------------------------

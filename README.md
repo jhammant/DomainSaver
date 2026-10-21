@@ -124,7 +124,7 @@ over RDAP. Note that `dig` is **not** used — see [Limitations](#limitations).
 ## Install
 
 ```bash
-git clone https://github.com/stephenlclarke/DomainSaver.git
+git clone https://github.com/jhammant/DomainSaver.git
 cd DomainSaver
 ./scripts/bootstrap.sh
 ```
@@ -192,6 +192,8 @@ When `CODEX_HOME` is explicitly set, the Codex target uses `$CODEX_HOME/skills/d
 ```
 
 Symlink mode is the default, so `--target both` gives both hosts the same skill files and caches. Use `--copy` if the checkout may move; with `--target both`, copy mode creates two independent snapshots. Each host resolves the copy it loaded: Claude Code supplies `${CLAUDE_SKILL_DIR}`, while Codex exposes the loaded `SKILL.md` path to the agent. Use `--force` to replace an existing installation. `--prefix DIR` remains available for one target at a time; direct shell use from a custom prefix can set `DOMAINSAVER_HOME=DIR/domain-search`.
+
+For a 1.0 or 1.1 symlink install in the default location, run `./install.sh --target both --force` once to convert the old layout and install for both hosts. This replaces the installed directories with links to the checkout. The source files stay in place. A valid legacy install can also be removed with `--uninstall` without `--force`.
 
 Uninstall with the same target used to install. With no target, uninstall also defaults to Claude Code:
 

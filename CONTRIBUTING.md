@@ -60,6 +60,18 @@ shellcheck -x -P scripts -S warning scripts/*.sh tests/*.sh install.sh
 markdownlint-cli2 "**/*.md"
 ```
 
+## Recording the demo
+
+`demo/demo.tape` requires VHS, a signed-in Codex CLI, and the skill installed with `./install.sh --target codex`. Export your Porkbun credentials in the shell for the live quote. Never put them in the tape or recorded terminal.
+
+The tape runs Codex with `danger-full-access` so it can use the network. Run it in a checkout where you are comfortable granting that access:
+
+```bash
+vhs demo/demo.tape
+```
+
+The recording waits for a specific live price for `shed.link`. If that price changes, update the wait pattern and price captions to match the actual result before recording. Keep repository links pointed at `jhammant/DomainSaver`.
+
 ## House rules
 
 - **Markdown code fences must be language-labelled.** Use ` ```bash `, ` ```yaml `,

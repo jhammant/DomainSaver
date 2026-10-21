@@ -331,8 +331,8 @@ _in_check_deps() {
 }
 
 # _in_is_ours <dest>
-#   Exit 0 for a valid copied-install marker, or for a DomainSaver directory
-#   symlink that uninstall can safely unlink without touching its target.
+#   Exit 0 for a valid copy or legacy symlink-mode marker, or for a
+#   DomainSaver directory symlink that can be unlinked without its target.
 _in_is_ours() {
 	if [ -h "$1" ]; then
 		[ -f "$1/SKILL.md" ] &&
@@ -342,7 +342,7 @@ _in_is_ours() {
 
 	[ -f "$1/$IN_MARKER" ] || return 1
 	grep -qx "skill=$IN_SKILL_NAME" "$1/$IN_MARKER" 2>/dev/null &&
-		grep -qx 'mode=copy' "$1/$IN_MARKER" 2>/dev/null
+		grep -Eqx 'mode=(copy|symlink)' "$1/$IN_MARKER" 2>/dev/null
 }
 
 # _in_preflight_parent <skills-dir>
