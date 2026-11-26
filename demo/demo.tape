@@ -1,37 +1,44 @@
-# DomainSaver demo — the whole pitch in ~25 seconds.
+# DomainSaver demo — a faithful Codex version of the original terminal reveal.
 #
-# Render:  vhs demo/demo.tape
-# Output:  demo/demo.gif
+# Render from the repository root:
 #
-# REQUIRES PORKBUN_API_KEY / PORKBUN_SECRET_KEY in the environment. Without
-# them quote.sh cannot make a per-name call, and the reveal (the entire point
-# of the demo) degrades to a "no credentials" message.
+#   PORKBUN_API_KEY=... PORKBUN_SECRET_KEY=... vhs demo/demo.tape
 #
-# The numbers below are not staged: shed.link really is quoted at $819.27/yr
-# against a $7.72 list price. Re-render whenever the CLI output changes so the
-# GIF can never drift from reality.
+# Output: demo/demo.gif
+#
+# Requirements:
+#   * Codex CLI installed and signed in with a ChatGPT account.
+#   * The domain-search skill installed with ./install.sh --target codex.
+#   * PORKBUN_API_KEY / PORKBUN_SECRET_KEY exported for the live quote.
+#
+# Original work by Jon Hammant with Claude:
+#   https://github.com/jhammant/DomainSaver
+#
+# The visible interaction keeps the original check, warning and quote sequence.
+# The only functional change is that each operation is requested through the
+# $domain-search skill. The hidden helper selects non-interactive execution,
+# low reasoning effort and live network access, then removes Markdown markers
+# for the original plain-terminal look. None of that is part of the prompt and
+# no response is staged.
 
 Output demo/demo.gif
 
+Require codex
+
 Set Shell bash
 Set FontSize 18
-# quote.sh's table is ~115 columns. Narrower than this and the NOTES column
-# wraps, which is exactly the row a viewer needs to read in one glance.
 Set Width 1500
-# Height is deliberately tight: each act is ~13 lines, and any spare rows
-# become dead space that dominates the frame once the GIF is letterboxed
-# into a square or 16:9 video for social.
 Set Height 480
 Set Padding 24
 Set Theme "Catppuccin Mocha"
 Set TypingSpeed 45ms
 Set PlaybackSpeed 1.0
+Set WaitTimeout 180s
 
-# No `cd`: vhs inherits the working directory, so render from the repo root
-# (`vhs demo/demo.tape`). Hard-coding a path both breaks for other people and
-# prints the renderer's home directory into a public asset, because check.sh
-# names the absolute path to quote.sh in its warning.
+# Keep recording-only launch settings off screen. Codex still uses the normal
+# ChatGPT login and installed $domain-search skill.
 Hide
+Type `codex() { command codex exec --ignore-user-config --ephemeral -s danger-full-access -c model_reasoning_effort=low "$@" 2>/dev/null | tr -d '*\140'; }` Enter
 Type "clear" Enter
 Show
 
@@ -40,10 +47,16 @@ Sleep 800ms
 # --- Act 1: what every other tool tells you ------------------------------
 Type "# Every domain tool says this name is available." Enter
 Sleep 1200ms
-Type "./scripts/check.sh shed.link" Enter
-Sleep 6s
+Type "codex '$domain-search Check shed.link without a quote'" Enter
 
-# --- Act 2: the tool refuses to say 'available' --------------------------
+# Hide only the model wait; resume on the real registry result.
+Sleep 600ms
+Hide
+Wait+Screen@90s /UNREGISTERED/
+Show
+Sleep 1800ms
+
+# --- Act 2: the skill refuses to say 'available' ------------------------
 Type "" Enter
 Type "# UNREGISTERED. Not AVAILABLE. It will not guess." Enter
 Sleep 2s
@@ -55,12 +68,19 @@ Type "clear" Enter
 Sleep 500ms
 Type "# So ask the registrar what it actually costs." Enter
 Sleep 1200ms
-Type "./scripts/quote.sh shed.link" Enter
-Sleep 7s
+Type "codex '$domain-search Quote shed.link'" Enter
+
+Sleep 600ms
+Hide
+Wait+Screen@90s /819.27/
+Show
+Sleep 2200ms
 
 Type "" Enter
 Type "# $819.27/yr. 106x the list price." Enter
 Sleep 2500ms
+Type "# Original work: Jon Hammant + Claude" Enter
+Sleep 1600ms
 Type "# github.com/jhammant/DomainSaver" Enter
 Sleep 3s
 

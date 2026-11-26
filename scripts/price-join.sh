@@ -124,7 +124,17 @@ _pj_out=$(awk -F'\t' -v OFS='\t' -v want="$PJ_STATUS" '
 	/^#/ || NF < 3          { next }
 	want != "" && $1 != want { next }
 	{
-		p = ($3 in price) ? price[$3] : "-" OFS "-"
+		# Sweep rows carry the registry TLD in field 3, but registrars can
+		# price a longer public suffix independently (for example, co.uk).
+		# Prefer that two-label suffix when the price table has one; flags
+		# remain keyed by the registry TLD below.
+		price_key = $3
+		n = split($2, labels, ".")
+		if (n >= 3) {
+			two_label_key = labels[n - 1] "." $3
+			if (two_label_key in price) price_key = two_label_key
+		}
+		p = (price_key in price) ? price[price_key] : "-" OFS "-"
 		f = ($3 in flag)  ? flag[$3]  : "-"
 		print $2, p, f
 	}

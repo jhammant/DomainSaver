@@ -3,9 +3,11 @@
 #
 # bootstrap.sh - refresh DomainSaver's local caches in data/.
 #
-# Everything in data/ is DERIVED, disposable data. Delete the directory and
-# re-run this script and you are back where you started. Nothing here needs
-# credentials: both upstream sources are public and unauthenticated.
+# The downloaded caches in data/ are derived and disposable, but the directory
+# also contains hand-maintained registry limits, reputation flags and RDAP
+# overrides. Delete only generated files when refreshing; bootstrap preserves
+# those local policy files but cannot reconstruct custom edits to them. Neither
+# upstream source needs credentials.
 #
 # WHAT IT PRODUCES (canonical names are the ones lib.sh reads):
 #   data/rdap-bootstrap.json   raw IANA RDAP bootstrap  (data.iana.org/rdap/dns.json)
@@ -535,7 +537,6 @@ _bs_write_templates_and_aliases() {
 			printf '#\n'
 			printf '# Examples (uncomment to use):\n'
 			printf '# app\thttps://pubapi.registry.google/rdap\n'
-			printf '# info\tWHOIS\n'
 		} >"$_bso_tmp"
 		_bs_install_file "$_bso_tmp" "$DS_RDAP_OVERRIDES_TSV"
 		ds_log "      wrote template $DS_RDAP_OVERRIDES_TSV"

@@ -1,11 +1,64 @@
 #!/usr/bin/env bash
 # shellcheck shell=bash
+# ---------------------------------------------------------------------------
+# USAGE:
+#   __SCRIPT_NAME__ - install the DomainSaver domain-search skill for Claude or Codex
 #
-# install.sh - install the DomainSaver /domain-search skill for Claude Code.
+# INSTALL:
+#   ./__SCRIPT_NAME__                         # Claude Code (the default)
+#   ./__SCRIPT_NAME__ --target codex          # Codex
+#   ./__SCRIPT_NAME__ --target both           # both hosts, one shared checkout
+#   ./__SCRIPT_NAME__ --copy --target codex   # snapshot instead of a link
 #
-#     ./install.sh              # symlink the toolkit into ~/.claude/skills
-#     ./install.sh --copy       # copy it instead (for a machine without the repo)
-#     ./install.sh --uninstall  # remove it again
+# UNINSTALL:
+#   ./__SCRIPT_NAME__ --uninstall                         # Claude Code
+#   ./__SCRIPT_NAME__ --uninstall --target codex          # Codex
+#   ./__SCRIPT_NAME__ --uninstall --target both           # both hosts
+#
+# OPTIONS:
+#   -t, --target TARGET  Install for claude, codex or both (default: claude).
+#                        Fresh Codex installs use ~/.agents/skills; an existing
+#                        ~/.codex/skills/domain-search install stays there.
+#                        Claude Code uses
+#                        ${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills.
+#       --copy           Copy the toolkit instead of symlinking it. Use this
+#                        when the checkout will be moved or deleted; re-run the
+#                        installer to pick up later changes. With target both,
+#                        this creates two independent snapshots.
+#       --symlink        Link to this checkout (the default). A git pull updates
+#                        the installed skill, and data/ caches are shared.
+#       --uninstall      Remove an installed skill and exit.
+#   -p, --prefix DIR     Install into this skills directory. Valid with one
+#                        target only; overrides that target's default path.
+#   -f, --force          Replace an existing installation. With --uninstall,
+#                        also remove a directory not recognised as DomainSaver.
+#   -n, --dry-run        Print what would happen and change nothing.
+#   -q, --quiet          Print only warnings and errors.
+#   -h, --help           Show this help text.
+#   -V, --version        Show the installer version.
+#
+# ENVIRONMENT:
+#   CLAUDE_CONFIG_DIR    Override Claude Code's ~/.claude configuration root.
+#   CODEX_HOME           Compatibility override for the Codex skills root;
+#                        the installer uses $CODEX_HOME/skills.
+#   PORKBUN_API_KEY      Optional public key used later by quote.sh.
+#   PORKBUN_SECRET_KEY   Optional secret key used later by quote.sh.
+#
+# AFTER INSTALLING:
+#   1. Populate the public-data caches:
+#        <skill-dir>/scripts/bootstrap.sh
+#   2. Optionally export PORKBUN_API_KEY and PORKBUN_SECRET_KEY for real
+#      per-name quotes. Keep both credentials out of the repository.
+#   3. Start or restart the selected host, then invoke the skill as:
+#        Claude Code:  /domain-search
+#        Codex:        $domain-search
+#
+# EXIT STATUS:
+#   0  Installed, uninstalled, or nothing to do
+#   1  Failure (bad path, refused overwrite, or missing files)
+#   2  Usage error
+# ENDUSAGE
+# ---------------------------------------------------------------------------
 #
 # WHAT IT INSTALLS
 #   <skills-dir>/domain-search/
@@ -14,10 +67,12 @@
 #     wordlists/    curated candidate wordlists
 #     data/         the derived caches (created by bootstrap.sh if absent)
 #
-#   SYMLINK MODE (default) links each of those to this checkout, so `git pull`
-#   updates the installed skill and the caches in data/ are shared with the
-#   repo. COPY MODE takes a snapshot, which survives the checkout being moved
-#   or deleted but has to be re-installed to update.
+#   SYMLINK MODE (default) links the skill directory to this checkout, so
+#   `git pull` updates the installed skill and the caches in data/ are shared
+#   with the repo. Both hosts support linked skill directories; linking the
+#   package as a whole also avoids host-specific treatment of a linked SKILL.md.
+#   COPY MODE takes a snapshot, which survives the checkout being moved or
+#   deleted but has to be re-installed to update.
 #
 # DESIGN CONSTRAINTS (same as the rest of the toolkit, deliberate):
 #   * bash 3.2 compatible - no associative arrays, no `declare -A`, no readarray.
@@ -30,9 +85,12 @@
 
 set -euo pipefail
 
-IN_VERSION="1.0.0"
-IN_SKILL_NAME="domain-search"
-IN_MARKER=".domainsaver-install"
+readonly SELF_PATH="${BASH_SOURCE[0]:-$0}"
+SCRIPT_NAME="$(basename "$SELF_PATH")"
+readonly SCRIPT_NAME
+readonly IN_VERSION="1.2.0"
+readonly IN_SKILL_NAME="domain-search"
+readonly IN_MARKER=".domainsaver-install"
 
 # Everything installed, in order. Missing optional items are skipped with a
 # note rather than failing the install.
@@ -41,28 +99,34 @@ IN_OPTIONAL_ITEMS="wordlists data README.md LICENSE"
 
 IN_MODE="symlink" # symlink | copy
 IN_ACTION="install"
+IN_TARGET="claude" # claude | codex | both
 IN_FORCE=0
 IN_DRYRUN=0
 IN_QUIET=0
 IN_SKILLS_DIR=""
 
-# ---------------------------------------------------------------------------
-# SECTION 1: output helpers
-# ---------------------------------------------------------------------------
-
-_in_say() {
+# Print an informational message unless quiet mode is enabled.
+info() {
 	[ "$IN_QUIET" = "1" ] && return 0
 	printf '%s\n' "$*"
 	return 0
 }
 
-_in_warn() {
+# Print a warning message to stderr.
+warning() {
 	printf 'WARN: %s\n' "$*" >&2
 	return 0
 }
 
-_in_die() {
-	printf 'FATAL: %s\n' "$*" >&2
+# Print an error message to stderr.
+error() {
+	printf 'ERROR: %s\n' "$*" >&2
+	return 0
+}
+
+# Print an error message and exit with a general failure status.
+die() {
+	error "$*"
 	exit 1
 }
 
@@ -70,93 +134,90 @@ _in_die() {
 #   Runs a command, or prints it under --dry-run. Every filesystem mutation in
 #   this script goes through here, so --dry-run is genuinely side-effect free.
 _in_run() {
-	_inr_what="$1"
+	local what="$1"
 	shift
 	if [ "$IN_DRYRUN" = "1" ]; then
-		printf 'would %s\n' "$_inr_what"
+		info "would $what"
 		return 0
 	fi
-	"$@" || _in_die "failed to $_inr_what"
-	unset _inr_what
+	"$@" || die "failed to $what"
 	return 0
 }
 
-# ---------------------------------------------------------------------------
-# SECTION 2: usage
-# ---------------------------------------------------------------------------
-
-_in_usage() {
-	cat <<EOF
-install.sh $IN_VERSION - install the DomainSaver "/$IN_SKILL_NAME" skill
-
-USAGE
-  ./install.sh [options]
-  ./install.sh --uninstall [options]
-
-OPTIONS
-      --copy           copy the toolkit instead of symlinking it. Use this when
-                       the checkout will be moved or deleted; you must re-run
-                       install.sh to pick up later changes.
-      --symlink        link to this checkout (the default): 'git pull' updates
-                       the installed skill, and data/ caches are shared.
-      --uninstall      remove an installed skill and exit.
-  -p, --prefix DIR     skills directory to install into.
-                       Default: \${CLAUDE_CONFIG_DIR:-\$HOME/.claude}/skills
-  -f, --force          replace an existing installation (or, with --uninstall,
-                       remove a directory this script cannot prove it created).
-  -n, --dry-run        print what would happen and change nothing.
-  -q, --quiet          only warnings and errors.
-  -h, --help           this text.
-  -V, --version        print the version and exit.
-
-AFTER INSTALLING
-  1. Populate the caches (public data, no credentials needed):
-         <skill-dir>/scripts/bootstrap.sh
-  2. Optional but recommended - real per-name quotes, which are the only way
-     the toolkit can ever say AVAILABLE rather than UNREGISTERED:
-         export PORKBUN_API_KEY='pk1_...'
-         export PORKBUN_SECRET_KEY='sk1_...'
-     Get a key at https://porkbun.com/account/api. Keep it out of the repo.
-  3. Start a new Claude Code session and ask it to find or check a domain.
-
-EXIT STATUS
-  0  installed, uninstalled, or nothing to do
-  1  failure (bad path, refused overwrite, missing files)
-  2  usage error
-EOF
+# Print the embedded usage text from the script header.
+usage() {
+	awk -v script_name="$SCRIPT_NAME" '
+		BEGIN { printing = 0 }
+		/^# USAGE:/ { printing = 1; next }
+		printing && /^# ENDUSAGE/ { exit }
+		printing {
+			sub(/^#[ ]?/, "", $0)
+			gsub(/__SCRIPT_NAME__/, script_name, $0)
+			print
+		}
+	' "$SELF_PATH"
 }
 
+# Print an argument error with usage and exit with status 2.
 _in_usage_error() {
-	printf 'usage error: %s\n\n' "$*" >&2
-	_in_usage >&2
+	error "$*"
+	printf '\n' >&2
+	usage >&2
 	exit 2
 }
 
-# ---------------------------------------------------------------------------
-# SECTION 3: argument parsing
-# ---------------------------------------------------------------------------
-
+# Parse installer options into the global installation settings.
 _in_parse_args() {
 	while [ "$#" -gt 0 ]; do
 		case "$1" in
-		--copy) IN_MODE="copy" ;;
-		--symlink | --link) IN_MODE="symlink" ;;
-		--uninstall | --remove) IN_ACTION="uninstall" ;;
-		-f | --force) IN_FORCE=1 ;;
-		-n | --dry-run) IN_DRYRUN=1 ;;
-		-q | --quiet) IN_QUIET=1 ;;
+		-t | --target)
+			[ "$#" -ge 2 ] || _in_usage_error "$1 needs codex, claude or both"
+			IN_TARGET="$2"
+			shift 2
+			;;
+		--target=*)
+			IN_TARGET="${1#*=}"
+			shift
+			;;
+		--copy)
+			IN_MODE="copy"
+			shift
+			;;
+		--symlink | --link)
+			IN_MODE="symlink"
+			shift
+			;;
+		--uninstall | --remove)
+			IN_ACTION="uninstall"
+			shift
+			;;
+		-f | --force)
+			IN_FORCE=1
+			shift
+			;;
+		-n | --dry-run)
+			IN_DRYRUN=1
+			shift
+			;;
+		-q | --quiet)
+			IN_QUIET=1
+			shift
+			;;
 		-p | --prefix)
 			[ "$#" -ge 2 ] || _in_usage_error "--prefix needs a directory"
-			shift
-			IN_SKILLS_DIR="$1"
+			IN_SKILLS_DIR="$2"
+			shift 2
 			;;
-		--prefix=*) IN_SKILLS_DIR="${1#*=}" ;;
+		--prefix=*)
+			IN_SKILLS_DIR="${1#*=}"
+			shift
+			;;
 		-h | --help)
-			_in_usage
+			usage
 			exit 0
 			;;
 		-V | --version)
-			printf 'install.sh %s (DomainSaver)\n' "$IN_VERSION"
+			printf '%s %s (DomainSaver)\n' "$SCRIPT_NAME" "$IN_VERSION"
 			exit 0
 			;;
 		--)
@@ -167,14 +228,17 @@ _in_parse_args() {
 		-*) _in_usage_error "unknown option: $1" ;;
 		*) _in_usage_error "unexpected argument: $1 (this script takes options only)" ;;
 		esac
-		shift
 	done
+
+	case "$IN_TARGET" in
+	codex | claude | both) ;;
+	*) _in_usage_error "unknown target '$IN_TARGET' (expected codex, claude or both)" ;;
+	esac
+	if [ "$IN_TARGET" = "both" ] && [ -n "$IN_SKILLS_DIR" ]; then
+		_in_usage_error "--prefix cannot be combined with --target both; select one target at a time for custom paths"
+	fi
 	return 0
 }
-
-# ---------------------------------------------------------------------------
-# SECTION 4: paths
-# ---------------------------------------------------------------------------
 
 # _in_resolve_self_dir
 #   Stdout: the absolute directory containing this script, following symlinks,
@@ -193,21 +257,33 @@ _in_resolve_self_dir() {
 	cd -P "$(dirname "$_ins_src")" >/dev/null 2>&1 && pwd
 }
 
-# _in_skills_dir
-#   Stdout: the skills directory to install into. --prefix wins, then
-#   CLAUDE_CONFIG_DIR, then ~/.claude.
+# _in_skills_dir <target>
+#   Stdout: the selected host's personal skills directory. --prefix wins for a
+#   single target. CODEX_HOME/skills remains a compatibility override for Codex
+#   installations made by DomainSaver 1.1 and older.
 _in_skills_dir() {
 	if [ -n "$IN_SKILLS_DIR" ]; then
 		printf '%s\n' "$IN_SKILLS_DIR"
 		return 0
 	fi
-	printf '%s/skills\n' "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+	case "$1" in
+	claude)
+		printf '%s/skills\n' "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+		;;
+	codex)
+		if [ -n "${CODEX_HOME:-}" ]; then
+			printf '%s/skills\n' "$CODEX_HOME"
+		elif [ -e "$HOME/.codex/skills/$IN_SKILL_NAME" ] || [ -h "$HOME/.codex/skills/$IN_SKILL_NAME" ]; then
+			# Keep updating an installation created by DomainSaver 1.1 rather
+			# than leaving a duplicate skill at the current official location.
+			printf '%s/.codex/skills\n' "$HOME"
+		else
+			printf '%s/.agents/skills\n' "$HOME"
+		fi
+		;;
+	esac
 	return 0
 }
-
-# ---------------------------------------------------------------------------
-# SECTION 5: checks
-# ---------------------------------------------------------------------------
 
 # _in_check_source <src>
 #   Fatal unless <src> looks like a DomainSaver checkout with a usable skill.
@@ -215,15 +291,15 @@ _in_check_source() {
 	_inc_src="$1"
 
 	[ -f "$_inc_src/SKILL.md" ] ||
-		_in_die "no SKILL.md beside install.sh ($_inc_src) - run this from a DomainSaver checkout"
+		die "no SKILL.md beside $SCRIPT_NAME ($_inc_src) - run this from a DomainSaver checkout"
 	grep -q "^name:[ ]*$IN_SKILL_NAME" "$_inc_src/SKILL.md" ||
-		_in_die "$_inc_src/SKILL.md does not declare 'name: $IN_SKILL_NAME'"
+		die "$_inc_src/SKILL.md does not declare 'name: $IN_SKILL_NAME'"
 	[ -d "$_inc_src/scripts" ] ||
-		_in_die "no scripts/ directory in $_inc_src - the checkout is incomplete"
+		die "no scripts/ directory in $_inc_src - the checkout is incomplete"
 
 	for _inc_s in lib.sh bootstrap.sh generate.sh check.sh sweep.sh quote.sh; do
 		[ -f "$_inc_src/scripts/$_inc_s" ] ||
-			_in_die "missing $_inc_src/scripts/$_inc_s - the checkout is incomplete"
+			die "missing $_inc_src/scripts/$_inc_s - the checkout is incomplete"
 	done
 
 	unset _inc_src _inc_s 2>/dev/null || true
@@ -239,15 +315,15 @@ _in_check_deps() {
 		command -v "$_ind_t" >/dev/null 2>&1 || _ind_missing="$_ind_missing $_ind_t"
 	done
 	if [ -n "$_ind_missing" ]; then
-		_in_warn "not on PATH:$_ind_missing"
+		warning "not on PATH:$_ind_missing"
 		case "$_ind_missing" in
-		*jq*) _in_warn "  jq is required by bootstrap.sh and quote.sh" ;;
+		*jq*) warning "  jq is required by bootstrap.sh, quote.sh and RDAP response validation" ;;
 		esac
 		case "$_ind_missing" in
-		*whois*) _in_warn "  whois is required for .io/.co/.uk and all Identity Digital TLDs" ;;
+		*whois*) warning "  whois is required for no-RDAP TLDs such as .io, .co, .me and .de" ;;
 		esac
 		case "$_ind_missing" in
-		*curl*) _in_warn "  curl is required for every RDAP lookup" ;;
+		*curl*) warning "  curl is required for every RDAP lookup" ;;
 		esac
 	fi
 	unset _ind_missing _ind_t 2>/dev/null || true
@@ -255,12 +331,81 @@ _in_check_deps() {
 }
 
 # _in_is_ours <dest>
-#   Exit 0 if <dest> is an installation this script made, or is unmistakably a
-#   DomainSaver skill directory. Used to refuse deleting somebody else's files.
+#   Exit 0 for a valid copy or legacy symlink-mode marker, or for a
+#   DomainSaver directory symlink that can be unlinked without its target.
 _in_is_ours() {
-	[ -e "$1/$IN_MARKER" ] && return 0
-	[ -f "$1/SKILL.md" ] && grep -q "^name:[ ]*$IN_SKILL_NAME" "$1/SKILL.md" 2>/dev/null && return 0
-	return 1
+	if [ -h "$1" ]; then
+		[ -f "$1/SKILL.md" ] &&
+			grep -q "^name:[ ]*$IN_SKILL_NAME" "$1/SKILL.md" 2>/dev/null && return 0
+		return 1
+	fi
+
+	[ -f "$1/$IN_MARKER" ] || return 1
+	grep -qx "skill=$IN_SKILL_NAME" "$1/$IN_MARKER" 2>/dev/null &&
+		grep -Eqx 'mode=(copy|symlink)' "$1/$IN_MARKER" 2>/dev/null
+}
+
+# _in_preflight_parent <skills-dir>
+#   Verifies that an existing skills directory is writable, or that its nearest
+#   existing ancestor can create it. No check is needed for a dry run.
+_in_preflight_parent() {
+	local path parent next
+	path="$1"
+	[ "$IN_DRYRUN" = "1" ] && return 0
+
+	if [ -e "$path" ] && [ ! -d "$path" ]; then
+		die "$path exists but is not a directory"
+	fi
+	parent="$path"
+	while [ ! -d "$parent" ]; do
+		next=$(dirname "$parent")
+		[ "$next" != "$parent" ] || break
+		parent="$next"
+	done
+	[ -w "$parent" ] || die "$path cannot be created from unwritable parent $parent"
+	return 0
+}
+
+# _in_preflight_target <target> <source>
+#   Validates one destination without changing it. main checks every selected
+#   target before processing any of them, preventing partial --target both runs.
+_in_preflight_target() {
+	local target source skills dest
+	target="$1"
+	source="$2"
+	skills=$(_in_skills_dir "$target")
+	dest="$skills/$IN_SKILL_NAME"
+
+	case "$IN_ACTION" in
+	install)
+		_in_check_source "$source"
+		_in_preflight_parent "$skills"
+		if [ -e "$dest" ] || [ -h "$dest" ]; then
+			if [ "$IN_FORCE" != "1" ]; then
+				error "$dest already exists."
+				if _in_is_ours "$dest"; then
+					printf '       It looks like an existing DomainSaver install; re-run with --force to replace it.\n' >&2
+				else
+					printf '       It does NOT look like a DomainSaver install, so this script will not touch it.\n' >&2
+					printf '       Move it aside, or re-run with --force if you are sure.\n' >&2
+				fi
+				exit 1
+			fi
+		fi
+		;;
+	uninstall)
+		if [ -e "$dest" ] || [ -h "$dest" ]; then
+			_in_preflight_parent "$skills"
+			if ! _in_is_ours "$dest" && [ "$IN_FORCE" != "1" ]; then
+				error "$dest is not recognisably a DomainSaver install"
+				printf '       (no valid %s marker or DomainSaver skill symlink).\n' "$IN_MARKER" >&2
+				printf '       Refusing to delete it. Re-run with --force if you are sure.\n' >&2
+				exit 1
+			fi
+		fi
+		;;
+	esac
+	return 0
 }
 
 # _in_remove <dest>
@@ -274,12 +419,8 @@ _in_remove() {
 	return 0
 }
 
-# ---------------------------------------------------------------------------
-# SECTION 6: install / uninstall
-# ---------------------------------------------------------------------------
-
 # _in_install_item <src> <dest> <name>
-#   Installs one top-level item, symlinked or copied. An existing entry of the
+#   Copies one top-level item into a snapshot install. An existing entry of the
 #   same name is replaced (the directory itself was already cleared or is new).
 _in_install_item() {
 	_ini_src="$1/$3"
@@ -291,27 +432,21 @@ _in_install_item() {
 		_in_run "replace $_ini_dst" rm -rf "$_ini_dst"
 	fi
 
-	if [ "$IN_MODE" = "copy" ]; then
-		# -R (not -a, not -L): the only spelling portable across BSD and GNU cp.
-		# It copies the data/ alias symlinks as symlinks, which is correct -
-		# they are relative, so they keep resolving inside the snapshot.
-		_in_run "copy $3 -> $_ini_dst" cp -R "$_ini_src" "$_ini_dst"
-	else
-		# Absolute target: the link keeps working from any cwd, and it is
-		# obvious in `ls -l` where the real files live.
-		_in_run "link $3 -> $_ini_dst" ln -s "$_ini_src" "$_ini_dst"
-	fi
+	# -R (not -a, not -L): the only spelling portable across BSD and GNU cp.
+	# It copies the data/ alias symlinks as symlinks, which is correct - they
+	# are relative, so they keep resolving inside the snapshot.
+	_in_run "copy $3 -> $_ini_dst" cp -R "$_ini_src" "$_ini_dst"
 
 	unset _ini_src _ini_dst 2>/dev/null || true
 	return 0
 }
 
 # _in_write_marker <src> <dest>
-#   Records what was installed, how and from where. --uninstall trusts this
-#   file, and it is the fastest way to answer "which checkout is this skill?".
+#   Records what was installed, how and from where in a snapshot install.
+#   Linked installs are already self-identifying through their symlink target.
 _in_write_marker() {
 	if [ "$IN_DRYRUN" = "1" ]; then
-		printf 'would write %s/%s\n' "$2" "$IN_MARKER"
+		info "would write $2/$IN_MARKER"
 		return 0
 	fi
 	{
@@ -323,44 +458,41 @@ _in_write_marker() {
 		printf 'mode=%s\n' "$IN_MODE"
 		printf 'installer=%s\n' "$IN_VERSION"
 		printf 'installed=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || printf 'unknown')"
-	} >"$2/$IN_MARKER" || _in_die "cannot write $2/$IN_MARKER"
+	} >"$2/$IN_MARKER" || die "cannot write $2/$IN_MARKER"
 	return 0
 }
 
+# _in_do_install <source> <destination> <target>
+#   Installs one host's copy or symlink after its destination is resolved.
 _in_do_install() {
 	_ind_src="$1"
 	_ind_dest="$2"
-
-	_in_check_source "$_ind_src"
+	_ind_target="$3"
 
 	if [ -e "$_ind_dest" ] || [ -h "$_ind_dest" ]; then
-		if [ "$IN_FORCE" != "1" ]; then
-			printf 'FATAL: %s already exists.\n' "$_ind_dest" >&2
-			if _in_is_ours "$_ind_dest"; then
-				printf '       It looks like an existing DomainSaver install; re-run with --force to replace it.\n' >&2
-			else
-				printf '       It does NOT look like a DomainSaver install, so this script will not touch it.\n' >&2
-				printf '       Move it aside, or re-run with --force if you are sure.\n' >&2
-			fi
-			exit 1
-		fi
-		_in_say "replacing existing installation at $_ind_dest"
+		info "replacing existing installation at $_ind_dest"
 		_in_remove "$_ind_dest"
 	fi
 
-	_in_run "create $_ind_dest" mkdir -p "$_ind_dest"
+	if [ "$IN_MODE" = "symlink" ]; then
+		# Both hosts follow symlinked skill directories. Link the package as one
+		# unit so SKILL.md and all of its supporting files stay together.
+		_in_run "link $_ind_src -> $_ind_dest" ln -s "$_ind_src" "$_ind_dest"
+	else
+		_in_run "create $_ind_dest" mkdir -p "$_ind_dest"
 
-	for _ind_item in $IN_REQUIRED_ITEMS; do
-		_in_install_item "$_ind_src" "$_ind_dest" "$_ind_item" ||
-			_in_die "required item missing from the checkout: $_ind_item"
-	done
-	for _ind_item in $IN_OPTIONAL_ITEMS; do
-		if [ -e "$_ind_src/$_ind_item" ]; then
-			_in_install_item "$_ind_src" "$_ind_dest" "$_ind_item" || true
-		fi
-	done
+		for _ind_item in $IN_REQUIRED_ITEMS; do
+			_in_install_item "$_ind_src" "$_ind_dest" "$_ind_item" ||
+				die "required item missing from the checkout: $_ind_item"
+		done
+		for _ind_item in $IN_OPTIONAL_ITEMS; do
+			if [ -e "$_ind_src/$_ind_item" ]; then
+				_in_install_item "$_ind_src" "$_ind_dest" "$_ind_item" || true
+			fi
+		done
 
-	_in_write_marker "$_ind_src" "$_ind_dest"
+		_in_write_marker "$_ind_src" "$_ind_dest"
+	fi
 
 	# The scripts are run directly by the agent, so make sure they are runnable
 	# even from a checkout that lost its permission bits (a zip download will).
@@ -370,83 +502,100 @@ _in_do_install() {
 
 	_in_check_deps
 
-	_in_say ""
-	_in_say "installed: $_ind_dest"
-	_in_say "  mode:    $IN_MODE ($( [ "$IN_MODE" = symlink ] && printf 'tracks %s' "$_ind_src" || printf 'snapshot of %s' "$_ind_src" ))"
-	_in_say "  skill:   /$IN_SKILL_NAME"
-	_in_say ""
-	_in_say "Next steps:"
-	_in_say "  1. $_ind_dest/scripts/bootstrap.sh"
-	_in_say "       downloads the IANA RDAP map and the public Porkbun price list."
-	_in_say "       No credentials needed."
-	_in_say "  2. optional, for real per-name quotes (the only way to get a verdict"
-	_in_say "     of AVAILABLE instead of UNREGISTERED):"
-	_in_say "       export PORKBUN_API_KEY='pk1_...'"
-	_in_say "       export PORKBUN_SECRET_KEY='sk1_...'"
-	_in_say "       key: https://porkbun.com/account/api  (never commit it)"
-	_in_say "  3. start a new Claude Code session and ask it to find or check a domain."
+	info ""
+	info "installed: $_ind_dest"
+	info "  mode:    $IN_MODE ($( [ "$IN_MODE" = symlink ] && printf 'tracks %s' "$_ind_src" || printf 'snapshot of %s' "$_ind_src" ))"
+	info "  target:  $_ind_target"
+	info ""
+	info "Next steps for $_ind_target:"
+	info "  1. $_ind_dest/scripts/bootstrap.sh"
+	info "       downloads the IANA RDAP map and the public Porkbun price list."
+	info "       No credentials needed."
+	info "  2. optional, for real per-name quotes (the only way to get a verdict"
+	info "     of AVAILABLE instead of UNREGISTERED):"
+	info "       export PORKBUN_API_KEY='pk1_...'"
+	info "       export PORKBUN_SECRET_KEY='sk1_...'"
+	info "       key: https://porkbun.com/account/api  (never commit it)"
+	case "$_ind_target" in
+	claude) info "  3. start or restart Claude Code, then invoke /$IN_SKILL_NAME." ;;
+	codex) info "  3. start or restart Codex, then invoke \$$IN_SKILL_NAME." ;;
+	esac
 	if [ "$IN_MODE" = "symlink" ]; then
-		_in_say ""
-		_in_say "Note: this install points at $_ind_src."
-		_in_say "      Moving or deleting that checkout breaks the skill; re-run"
-		_in_say "      install.sh --copy --force if you want a standalone snapshot."
+		info ""
+		info "Note: this install points at $_ind_src."
+		info "      Moving or deleting that checkout breaks the skill; re-run"
+		info "      $SCRIPT_NAME --copy --force if you want a standalone snapshot."
 	fi
 
-	unset _ind_src _ind_dest _ind_item 2>/dev/null || true
+	unset _ind_src _ind_dest _ind_target _ind_item 2>/dev/null || true
 	return 0
 }
 
+# _in_do_uninstall <destination>
+#   Removes one selected host's installation when it is recognisably ours.
 _in_do_uninstall() {
 	_inu_dest="$1"
 
 	if [ ! -e "$_inu_dest" ] && [ ! -h "$_inu_dest" ]; then
-		_in_say "nothing to do: $_inu_dest does not exist"
+		info "nothing to do: $_inu_dest does not exist"
 		return 0
 	fi
 
-	if ! _in_is_ours "$_inu_dest" && [ "$IN_FORCE" != "1" ]; then
-		printf 'FATAL: %s is not recognisably a DomainSaver install\n' "$_inu_dest" >&2
-		printf '       (no %s marker and no matching SKILL.md).\n' "$IN_MARKER" >&2
-		printf '       Refusing to delete it. Re-run with --force if you are sure.\n' >&2
-		exit 1
-	fi
-
 	_in_remove "$_inu_dest"
-	_in_say "removed: $_inu_dest"
-	_in_say "note: caches in the original checkout's data/ were not touched."
+	info "removed: $_inu_dest"
+	info "note: caches in the original checkout's data/ were not touched."
 	unset _inu_dest
 	return 0
 }
 
-# ---------------------------------------------------------------------------
-# SECTION 7: main
-# ---------------------------------------------------------------------------
-
-main() {
-	_in_parse_args "$@"
-
-	IN_SRC=$(_in_resolve_self_dir) || _in_die "cannot resolve the directory of this script"
-	IN_SKILLS=$(_in_skills_dir)
-	IN_DEST="$IN_SKILLS/$IN_SKILL_NAME"
-
-	[ "$IN_DRYRUN" = "1" ] && _in_say "dry run: nothing will be changed"
+# _in_process_target <target> <source>
+#   Resolves one host's destination and performs the requested action.
+_in_process_target() {
+	_inp_target="$1"
+	_inp_src="$2"
+	_inp_skills=$(_in_skills_dir "$_inp_target")
+	_inp_dest="$_inp_skills/$IN_SKILL_NAME"
 
 	case "$IN_ACTION" in
 	uninstall)
-		_in_do_uninstall "$IN_DEST"
+		_in_do_uninstall "$_inp_dest"
 		;;
 	install)
-		_in_say "installing the /$IN_SKILL_NAME skill"
-		_in_say "  from: $IN_SRC"
-		_in_say "  to:   $IN_DEST"
-		if [ ! -d "$IN_SKILLS" ]; then
-			_in_run "create $IN_SKILLS" mkdir -p "$IN_SKILLS"
+		info "installing the $IN_SKILL_NAME skill for $_inp_target"
+		info "  from: $_inp_src"
+		info "  to:   $_inp_dest"
+		if [ ! -d "$_inp_skills" ]; then
+			_in_run "create $_inp_skills" mkdir -p "$_inp_skills"
 		fi
-		[ -w "$IN_SKILLS" ] || [ "$IN_DRYRUN" = "1" ] ||
-			_in_die "$IN_SKILLS is not writable"
-		_in_do_install "$IN_SRC" "$IN_DEST"
+		[ -w "$_inp_skills" ] || [ "$IN_DRYRUN" = "1" ] ||
+			die "$_inp_skills is not writable"
+		_in_do_install "$_inp_src" "$_inp_dest" "$_inp_target"
 		;;
 	esac
+
+	unset _inp_target _inp_src _inp_skills _inp_dest 2>/dev/null || true
+	return 0
+}
+
+# Parse arguments and execute the selected host operations.
+main() {
+	local source_dir targets target
+
+	_in_parse_args "$@"
+
+	source_dir=$(_in_resolve_self_dir) || die "cannot resolve the directory of this script"
+	[ "$IN_DRYRUN" = "1" ] && info "dry run: nothing will be changed"
+
+	case "$IN_TARGET" in
+	both) targets="claude codex" ;;
+	*) targets="$IN_TARGET" ;;
+	esac
+	for target in $targets; do
+		_in_preflight_target "$target" "$source_dir"
+	done
+	for target in $targets; do
+		_in_process_target "$target" "$source_dir"
+	done
 	return 0
 }
 

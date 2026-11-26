@@ -70,10 +70,19 @@ Write the interesting labels yourself, then expand mechanically. Aim for
 about 10% in `.com` and 80% in `.uk`, so a 20-name list mostly returns nothing.
 
 ```bash
-# Set DOMAINSAVER_HOME to the skill directory loaded by your current agent.
-# Codex default: ~/.agents/skills/domain-search; Claude: ~/.claude/skills/domain-search.
-DS="${DOMAINSAVER_HOME:-$HOME/.claude/skills/domain-search}"
-[ -f "$DS/SKILL.md" ] || DS="$HOME/.agents/skills/domain-search"
+# Always use the directory of this loaded skill when the host supplies it.
+# Claude Code expands CLAUDE_SKILL_DIR before running the block. In Codex, set
+# DOMAINSAVER_HOME from the SKILL.md path in the loaded skill metadata; the
+# standard-location fallbacks below keep direct shell use convenient.
+CLAUDE_DS='${CLAUDE_SKILL_DIR}'
+case "$CLAUDE_DS" in
+'$'{CLAUDE_SKILL_DIR}) CLAUDE_DS="" ;;
+esac
+DS="${DOMAINSAVER_HOME:-$CLAUDE_DS}"
+[ -n "$DS" ] && [ -d "$DS/scripts" ] || DS="${CODEX_HOME:-$HOME/.agents}/skills/domain-search"
+[ -d "$DS/scripts" ] || DS="$HOME/.codex/skills/domain-search"
+[ -d "$DS/scripts" ] || DS="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/domain-search"
+unset CLAUDE_DS
 
 # your own labels, crossed with plausible TLDs
 printf 'shed\nloft\nyard\nattic\ndepot\n' \
@@ -145,7 +154,7 @@ Output is `domain, standard_registration, standard_renewal, flags`.
 money is, expressed as USD per year:
 
 | TLD | Year one | Renews at | Multiple |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `.bar` | 2.57 | 52.01 | 20x |
 | `.codes` | 4.63 | 57.16 | 12x |
 | `.online` / `.site` / `.space` | ~1.96 | 26.26–28.84 | ~15x |
@@ -210,7 +219,7 @@ Practical consequences worth stating:
 ## What each step costs
 
 | Step | Cost | Scale |
-|---|---|---|
+| --- | --- | --- |
 | Generate | free, offline | unlimited |
 | Price-join | free, offline | unlimited |
 | `check.sh` | 1 registry query/name | up to ~25 |

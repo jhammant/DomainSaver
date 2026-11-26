@@ -29,7 +29,8 @@
 
 set -euo pipefail
 
-# shellcheck source=./lib.sh
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=lib.sh
 . "$(dirname "$0")/lib.sh"
 
 # Byte semantics everywhere. awk character classes, tr case folding and shell

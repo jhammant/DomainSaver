@@ -676,15 +676,25 @@ _dq_emit() {
 # SECTION 7: quoting one name
 # ---------------------------------------------------------------------------
 
-# _dq_std_prices <tld>
+# _dq_std_prices <domain> <registry_tld>
 #   Stdout: "<std_reg><TAB><std_renew>", empty fields when unknown.
+#   Registrars can price a two-label suffix such as co.uk independently from its
+#   registry TLD. Prefer that exact price row, then fall back to the final label.
 _dq_std_prices() {
-	if _dqs_row=$(ds_std_price "$1" 2>/dev/null); then
+	_dqs_domain="$1"
+	_dqs_tld="$2"
+	_dqs_suffix=$(printf '%s\n' "$_dqs_domain" | awk -F. '
+		NF >= 3 { print $(NF - 1) "." $NF }
+	')
+
+	if [ -n "$_dqs_suffix" ] && _dqs_row=$(ds_std_price "$_dqs_suffix" 2>/dev/null); then
+		printf '%s\n' "$_dqs_row"
+	elif _dqs_row=$(ds_std_price "$_dqs_tld" 2>/dev/null); then
 		printf '%s\n' "$_dqs_row"
 	else
 		printf '\t\n'
 	fi
-	unset _dqs_row
+	unset _dqs_domain _dqs_tld _dqs_suffix _dqs_row 2>/dev/null || true
 	return 0
 }
 
@@ -742,7 +752,7 @@ _dq_quote_one() {
 	_dqq_flags=""
 	[ -n "$_dqq_tld" ] && _dqq_flags=$(ds_tld_flags "$_dqq_tld")
 
-	_dqq_std=$(_dq_std_prices "$_dqq_tld")
+	_dqq_std=$(_dq_std_prices "$_dqq_dom" "$_dqq_tld")
 	_dqq_sreg=$(printf '%s' "$_dqq_std" | cut -f1)
 	_dqq_sren=$(printf '%s' "$_dqq_std" | cut -f2)
 

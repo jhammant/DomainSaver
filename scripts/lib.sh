@@ -431,8 +431,8 @@ _ds_tsv_lookup() {
 #     1. data/rdap-overrides.tsv  (user/bootstrap supplied; wins over all)
 #     2. Google Registry TLDs     -> https://pubapi.registry.google/rdap
 #     3. Known no-RDAP TLDs       -> whois
-#     4. Known Identity Digital   -> whois
-#     5. IANA bootstrap index, rejecting rdap.org and Identity Digital hosts
+#     4. IANA bootstrap index, rejecting banned proxy hosts and flagging slow
+#        registries so callers can throttle them
 #   Args:   $1 = TLD, with or without leading dot, any case.
 #   Stdout: the RDAP base URL with no trailing slash (e.g.
 #           "https://pubapi.registry.google/rdap"), and nothing else.
@@ -454,6 +454,11 @@ ds_rdap_endpoint() {
 			return 1
 			;;
 		esac
+		_dre_host=$(_ds_url_host "$_dre_ov")
+		if grep -qiE "$_DS_RDAP_HOST_BANNED_RE" <<<"$_dre_host"; then
+			ds_debug "rdap[$_dre_tld]: refusing banned override host $_dre_host, use whois"
+			return 1
+		fi
 		printf '%s\n' "${_dre_ov%/}"
 		return 0
 	fi
@@ -666,31 +671,50 @@ ds_probe_rdap() {
 	case "$_dpr_code" in
 	200)
 		# Some registries answer 200 with an RDAP error object rather than an
-		# HTTP error status, so trust the body over the status line.
-		_dpr_ec=""
-		if _ds_have jq; then
-			_dpr_ec=$(jq -r '.errorCode // empty' "$_dpr_body" 2>/dev/null) || _dpr_ec=""
+		# HTTP error status, so validate the body instead of trusting the status
+		# line. A malformed 200 response is not evidence of registration.
+		_dpr_shape="invalid"
+		if ! _ds_have jq; then
+			_dpr_detail="rdap:200 cannot validate response (jq not installed)"
+		elif ! _dpr_shape=$(jq -r '
+			if type != "object" then "invalid"
+			elif .errorCode? != null then "error:" + (.errorCode | tostring)
+			elif .objectClassName? == "domain" and
+				([.ldhName?, .unicodeName?] |
+				 map(select(type == "string" and length > 0)) | length > 0)
+			then "domain"
+			else "invalid"
+			end
+		' "$_dpr_body" 2>/dev/null); then
+			_dpr_shape="invalid"
 		fi
-		if [ "$_dpr_ec" = "404" ]; then
+
+		case "$_dpr_shape" in
+		error:404)
 			_dpr_status="UNREGISTERED"
 			_dpr_detail="rdap:200 errorCode=404"
 			_dpr_rc=0
-		elif [ -n "$_dpr_ec" ]; then
+			;;
+		error:*)
 			_dpr_status="ERROR"
-			_dpr_detail="rdap:200 errorCode=$_dpr_ec"
+			_dpr_detail="rdap:200 errorCode=${_dpr_shape#error:}"
 			_dpr_rc=1
-		else
+			;;
+		domain)
 			_dpr_status="REGISTERED"
 			_dpr_detail="rdap:200"
-			if _ds_have jq; then
-				_dpr_reg=$(jq -r '
-					[ .entities[]? | select(any(.roles[]?; . == "registrar"))
-					  | .vcardArray[1][]? | select(.[0] == "fn") | .[3] ][0] // empty
-				' "$_dpr_body" 2>/dev/null) || _dpr_reg=""
-				[ -n "$_dpr_reg" ] && _dpr_detail="rdap:200 registrar=$_dpr_reg"
-			fi
+			_dpr_reg=$(jq -r '
+				[ .entities[]? | select(any(.roles[]?; . == "registrar"))
+				  | .vcardArray[1][]? | select(.[0] == "fn") | .[3] ][0] // empty
+			' "$_dpr_body" 2>/dev/null) || _dpr_reg=""
+			[ -n "$_dpr_reg" ] && _dpr_detail="rdap:200 registrar=$_dpr_reg"
 			_dpr_rc=0
-		fi
+			;;
+		invalid)
+			[ "$_dpr_detail" != "rdap:200" ] ||
+				_dpr_detail="rdap:200 invalid RDAP response"
+			;;
+		esac
 		;;
 	404)
 		# The load-bearing case. Absent from the registry: available, RESERVED
@@ -710,7 +734,7 @@ ds_probe_rdap() {
 	rm -f "$_dpr_body"
 	printf '%s|%s|%s\n' "$_dpr_status" "$_dpr_dom" "$(_ds_sanitize_detail "$_dpr_detail")"
 	unset _dpr_dom _dpr_base _dpr_tld _dpr_url _dpr_body _dpr_attempt \
-		_dpr_code _dpr_sleep _dpr_status _dpr_detail _dpr_ec _dpr_reg 2>/dev/null || true
+		_dpr_code _dpr_sleep _dpr_status _dpr_detail _dpr_shape _dpr_reg 2>/dev/null || true
 	return "$_dpr_rc"
 }
 
@@ -762,8 +786,12 @@ ds_probe_whois() {
 		fi
 	fi
 
-	_dpw_out=$(_ds_timeout "$DS_WHOIS_TIMEOUT" whois -h "$_dpw_srv" "$_dpw_dom" 2>/dev/null)
-	_dpw_rc=$?
+	# A failed whois process is an expected lookup outcome, not a fatal shell
+	# error. Capture its status explicitly so callers running under `set -e`
+	# still receive the promised ERROR record below.
+	_dpw_out=""
+	_dpw_rc=0
+	_dpw_out=$(_ds_timeout "$DS_WHOIS_TIMEOUT" whois -h "$_dpw_srv" "$_dpw_dom" 2>/dev/null) || _dpw_rc=$?
 
 	if [ "$_dpw_rc" = "124" ]; then
 		printf 'ERROR|%s|%s\n' "$_dpw_dom" "whois:$_dpw_srv timeout after ${DS_WHOIS_TIMEOUT}s"
@@ -850,8 +878,8 @@ ds_probe() {
 	fi
 
 	if _dp_base=$(ds_rdap_endpoint "$_dp_tld"); then
-		_dp_res=$(ds_probe_rdap "$_dp_dom" "$_dp_base")
-		_dp_rc=$?
+		_dp_rc=0
+		_dp_res=$(ds_probe_rdap "$_dp_dom" "$_dp_base") || _dp_rc=$?
 		if [ "$_dp_rc" = "0" ]; then
 			printf '%s\n' "$_dp_res"
 			return 0
@@ -869,8 +897,8 @@ ds_probe() {
 		return 1
 	fi
 
-	_dp_res=$(ds_probe_whois "$_dp_dom")
-	_dp_rc=$?
+	_dp_rc=0
+	_dp_res=$(ds_probe_whois "$_dp_dom") || _dp_rc=$?
 	printf '%s\n' "$_dp_res"
 	unset _dp_dom _dp_tld _dp_base _dp_res _dp_rdap_detail
 	return "$_dp_rc"

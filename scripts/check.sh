@@ -41,7 +41,8 @@ if [ ! -r "$_CK_DIR/lib.sh" ]; then
 	printf '[ds] FATAL: cannot read %s/lib.sh (is the repo intact?)\n' "$_CK_DIR" >&2
 	exit 1
 fi
-# shellcheck source=./lib.sh
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=lib.sh
 . "$_CK_DIR/lib.sh"
 
 _CK_VERSION="1.0.0"

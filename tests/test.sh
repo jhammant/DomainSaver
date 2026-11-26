@@ -439,10 +439,13 @@ case "$url" in
 		# 200 carrying an RDAP error object: absent, despite the status line.
 		emit 200 '{"errorCode":404,"title":"Not Found"}'
 		;;
-	*servfail*)
-		emit 200 '{"errorCode":500,"title":"Internal Server Error"}'
-		;;
-	*taken* | google.*)
+		*servfail*)
+			emit 200 '{"errorCode":500,"title":"Internal Server Error"}'
+			;;
+		*malformed*)
+			emit 200 '<html>upstream proxy error</html>'
+			;;
+		*taken* | google.*)
 		emit 200 '{"objectClassName":"domain","ldhName":"'"$name"'","entities":[{"roles":["registrar"],"vcardArray":["vcard",[["version",{},"text","4.0"],["fn",{},"text","Stub Registrar Inc."]]]}]}'
 		;;
 	*)
@@ -613,6 +616,7 @@ awk 'BEGIN {
 	printf ",\"top\":{\"registration\":\"4.63\",\"renewal\":\"4.63\",\"transfer\":\"4.63\"}"
 	printf ",\"online\":{\"registration\":\"2.24\",\"renewal\":\"29.00\",\"transfer\":\"29.00\"}"
 	printf ",\"uk\":{\"registration\":\"8.06\",\"renewal\":\"8.06\",\"transfer\":\"8.06\"}"
+	printf ",\"co.uk\":{\"registration\":\"3.00\",\"renewal\":\"4.00\",\"transfer\":\"3.00\"}"
 	for (i = 1; i <= 900; i++)
 		printf ",\"t%04d\":{\"registration\":\"5.00\",\"renewal\":\"7.00\",\"transfer\":\"5.00\"}", i
 	printf "}}"
@@ -757,9 +761,33 @@ assert_contains "the pure-bash watchdog kills promptly, not after 20s" "prompt=y
 assert_contains "the watchdog passes a command's stdout through" "passthrough_out=hello" "$OUT"
 assert_contains "the watchdog passes a command's exit status through" "status_rc=7" "$OUT"
 
+# A nonzero whois process must still produce the library's machine-readable
+# ERROR record when its caller enables errexit. Without this, the assignment
+# that captures whois output terminates the shell before ds_probe_whois can
+# report the failed lookup.
+try bash -c 'set -e; . "$1"; whois() { return 1; }; ds_probe_whois example.co whois.invalid' \
+	_ "$LIB_SH"
+assert_rc "whois process failure exits as an ERROR result" 1 "$RC"
+assert_contains "whois process failure emits an ERROR record under errexit" \
+	"ERROR|example.co|whois:whois.invalid empty response" "$OUT"
+
+# A direct library caller may enable errexit without wrapping ds_probe in a
+# conditional. An RDAP failure must still reach the intended WHOIS fallback.
+try bash -c '
+	set -e
+	. "$1"
+	ds_rdap_endpoint() { printf "%s\n" "https://rdap.invalid"; }
+	ds_probe_rdap() { printf "%s\n" "ERROR|example.com|rdap:503"; return 1; }
+	ds_probe_whois() { printf "%s\n" "REGISTERED|example.com|whois:fallback"; return 0; }
+	ds_probe example.com
+' _ "$LIB_SH"
+assert_rc "RDAP failure falls back to WHOIS under errexit" 0 "$RC"
+assert_contains "the fallback result preserves both probe details" \
+	"REGISTERED|example.com|whois:fallback after rdap:503" "$OUT"
+
 section "lib.sh: registry routing rules"
 
-# Rule 3: Google Registry TLDs go to pubapi, never to the throttled bootstrap
+# Priority 2: Google Registry TLDs go to pubapi, never to the throttled bootstrap
 # endpoint. Asserted with an EMPTY cache, so it can only come from the rule.
 assert_eq "Google Registry TLDs route to pubapi.registry.google" \
 	"https://pubapi.registry.google/rdap" \
@@ -768,7 +796,7 @@ assert_eq ".foo also routes to pubapi.registry.google" \
 	"https://pubapi.registry.google/rdap" \
 	"$(lib_eval_in "$TMPDIR_T/empty-data" 'ds_rdap_endpoint foo')"
 
-# Rule 5: TLDs with no RDAP must report "use whois" (exit 1, nothing printed).
+# Priority 3: TLDs with no RDAP report "use whois" (exit 1, nothing printed).
 for t in io co me sh gg de nz; do
 	out=$(lib_eval_in "$TMPDIR_T/empty-data" "ds_rdap_endpoint $t")
 	rc=$?
@@ -779,7 +807,7 @@ for t in io co me sh gg de nz; do
 	fi
 done
 
-# Rule 4: Identity Digital throttles brutally, but its gTLDs are RDAP-ONLY.
+# Identity Digital throttles brutally, but its gTLDs are RDAP-ONLY.
 # ICANN sunset the WHOIS requirement for gTLDs, so IANA returns an empty
 # "whois:" line for them and diverting to whois can only ever produce ERROR.
 # Regression: betalab.fyi reported ERROR because .fyi was denied RDAP and has
@@ -791,7 +819,7 @@ ID_OUT=$(lib_eval_in "$TMPDIR_T/slow-data" 'ds_rdap_endpoint idtest')
 assert_rc "an Identity Digital endpoint is returned, not refused (RDAP-only registry)" 0 "$?"
 assert_contains "  and it is the Identity Digital endpoint" "identitydigital" "$ID_OUT"
 
-# Rule 2: the rdap.org proxy 429s after ~60 requests. THAT one is refused
+# The rdap.org proxy 429s after ~60 requests. THAT one is refused
 # outright, even if a bootstrap file or an override hands it to us. (The index
 # lives in slow-data, which exists: pointing this at a directory that does not
 # exist would make the test pass for the wrong reason - a missing index also
@@ -809,18 +837,21 @@ assert_eq "a host that merely looks like rdap.org is not banned" \
 	"https://rdap.orgtld.example/rdap" \
 	"$(lib_eval_in "$TMPDIR_T/slow-data" 'ds_rdap_endpoint proxytest')"
 
-# Rule 1: the override file wins over everything, in both directions.
+# Priority 1: the override file wins over everything, in both directions.
 mkdir -p "$TMPDIR_T/ovr-data"
 {
 	printf '# tld\turl\n'
 	printf 'app\thttps://rdap.override.test/rdap\n'
 	printf 'com\tWHOIS\n'
+	printf 'proxytest\thttps://sub.rdap.org/rdap\n'
 } >"$TMPDIR_T/ovr-data/rdap-overrides.tsv"
 assert_eq "rdap-overrides.tsv overrides even the Google routing rule" \
 	"https://rdap.override.test/rdap" \
 	"$(lib_eval_in "$TMPDIR_T/ovr-data" 'ds_rdap_endpoint app')"
 lib_eval_in "$TMPDIR_T/ovr-data" 'ds_rdap_endpoint com >/dev/null'
 assert_rc "rdap-overrides.tsv can force a TLD onto whois" 1 "$?"
+lib_eval_in "$TMPDIR_T/ovr-data" 'ds_rdap_endpoint proxytest >/dev/null'
+assert_rc "an override cannot bypass the banned RDAP proxy guard" 1 "$?"
 
 # The regression this project keeps re-learning: .co is whois.registry.co.
 assert_eq "ds_whois_server co is whois.registry.co, NOT whois.nic.co" \
@@ -1202,6 +1233,16 @@ ck -q --no-price softfree-name.com
 assert_eq "an RDAP 200 with errorCode 404 is UNREGISTERED" "UNREGISTERED" \
 	"$(col 2 softfree-name.com "$OUT")"
 
+# A transport-successful response is still not an answer unless its body is a
+# valid RDAP domain object. Captive portals and broken proxies commonly return
+# HTML with HTTP 200, which must remain ERROR rather than becoming REGISTERED.
+try env PATH="$STUB_PATH" DS_DATA_DIR="$E2E_DATA" DS_TEST_FIXTURES="$FIX" \
+	DS_RDAP_RETRIES=1 bash -c '. "$1"; ds_probe_rdap malformed-body.com "$2"' \
+	_ "$LIB_SH" "https://rdap.verisign.test/com/v1"
+assert_rc "a malformed RDAP 200 response exits as ERROR" 1 "$RC"
+assert_contains "a malformed RDAP 200 response is never REGISTERED" \
+	"ERROR|malformed-body.com|rdap:200 invalid RDAP response" "$OUT"
+
 # A throttled registry is not an answer. It must fall back to whois rather than
 # be reported as fact - and the fallback must be visible in the detail.
 : >"$WHOIS_LOG"
@@ -1421,6 +1462,8 @@ assert_file "bootstrap.sh builds the price table" "$BS_DATA/tld-prices.tsv"
 assert_file "bootstrap.sh seeds the whois server table" "$BS_DATA/whois-servers.tsv"
 assert_file "bootstrap.sh seeds the reputation table" "$BS_DATA/tld-flags.tsv"
 assert_file "bootstrap.sh writes the overrides template" "$BS_DATA/rdap-overrides.tsv"
+assert_not_contains "the overrides template does not divert RDAP-only .info to WHOIS" \
+	$'info\tWHOIS' "$(cat "$BS_DATA/rdap-overrides.tsv")"
 
 assert_ge "the RDAP index has a sane row count (>=1000 TLDs)" 1000 "$(rows "$BS_DATA/rdap-endpoints.tsv")"
 assert_ge "the price table has a sane row count (>=500 TLDs)" 500 "$(rows "$BS_DATA/tld-prices.tsv")"
@@ -1437,6 +1480,16 @@ assert_eq "bootstrap seeds .co as whois.registry.co" "whois.registry.co" \
 	"$(awk -F'\t' '$1 == "co" { print $2 }' "$BS_DATA/whois-servers.tsv")"
 assert_eq "bootstrap seeds .io so lib.sh can read it back" "whois.nic.io" \
 	"$(lib_eval_in "$BS_DATA" 'ds_whois_server io')"
+
+# price-join receives the registry TLD from sweep.sh, but registrars can price
+# a longer suffix independently. It must use co.uk's price while retaining uk's
+# registry-level reputation flags.
+printf 'UNREGISTERED\tshortlist.co.uk\tuk\t-\t1\trdap:404\n' >"$TMPDIR_T/co-uk-sweep.tsv"
+try env DS_DATA_DIR="$BS_DATA" bash "$SCRIPTS_DIR/price-join.sh" --no-sort \
+	"$TMPDIR_T/co-uk-sweep.tsv"
+assert_rc "price-join.sh handles a multi-label priced suffix" 0 "$RC"
+assert_eq "price-join.sh prefers co.uk pricing over uk pricing" \
+	$'shortlist.co.uk\t3.00\t4.00\tNO_PREMIUM_REGISTRY' "$OUT"
 
 # lib.sh must still refuse the poisoned endpoints the bootstrap file contains.
 lib_eval_in "$BS_DATA" 'ds_rdap_endpoint zzz >/dev/null'
@@ -1541,6 +1594,17 @@ cat >"$QFIX/trap.bar.json" <<'EOF'
 "limits":{"TTL":10,"limit":1},"ttlRemaining":0}
 EOF
 
+# Porkbun prices co.uk independently from bare uk. The fixture price table has
+# no uk row, so this quote is only recognised as premium when the registrable
+# two-label suffix supplies the correct standard-price baseline.
+cat >"$QFIX/priced.co.uk.json" <<'EOF'
+{"status":"SUCCESS","response":{"avail":"yes","type":"registration","price":"30.00",
+"regularPrice":"30.00","firstYearPromo":"no","premium":"no","minDuration":1,
+"additional":{"renewal":{"price":"40.00","regularPrice":"40.00"},
+"transfer":{"price":"30.00","regularPrice":"30.00"}}},
+"limits":{"TTL":10,"limit":1},"ttlRemaining":0}
+EOF
+
 cat >"$QFIX/sold.link.json" <<'EOF'
 {"status":"SUCCESS","response":{"avail":"no","type":"registration","price":"7.72",
 "regularPrice":"7.72","firstYearPromo":"no","premium":"no","minDuration":1,
@@ -1572,7 +1636,7 @@ quote() { # quote <args...>  - fixtures, no credentials, no network
 		bash "$SCRIPTS_DIR/quote.sh" -o tsv --probe never "$@"
 }
 
-quote shed.link plainname.link flagged.link noprice.link trap.bar sold.link
+quote shed.link plainname.link flagged.link noprice.link trap.bar priced.co.uk sold.link
 assert_rc "quote.sh exits 0 when every name got a verdict" 0 "$RC"
 
 assert_eq "a name quoted at 106x its list price is PREMIUM, not AVAILABLE" \
@@ -1592,6 +1656,12 @@ assert_eq "a cheap first year with a 5x renewal is PREMIUM (renewal decides)" \
 	"PREMIUM" "$(col 2 trap.bar "$OUT")"
 assert_contains "and the first-year promotion is called out" "FIRST_YEAR_PROMO" \
 	"$(col 10 trap.bar "$OUT")"
+assert_eq "a co.uk quote uses the co.uk list-price baseline" \
+	"PREMIUM" "$(col 2 priced.co.uk "$OUT")"
+assert_eq "the co.uk renewal baseline is not looked up as bare uk" \
+	"9.42" "$(col 7 priced.co.uk "$OUT")"
+assert_contains "the multi-label quote records its price comparison" "PRICE_OVER_LIST" \
+	"$(col 10 priced.co.uk "$OUT")"
 assert_eq "an unsellable name with --probe never is UNAVAILABLE" \
 	"UNAVAILABLE" "$(col 2 sold.link "$OUT")"
 assert_eq "an unsellable name carries no quoted price" "-" "$(col 3 sold.link "$OUT")"
@@ -1690,8 +1760,8 @@ assert_contains "a small price difference is not a premium" "AVAILABLE" "$OUT"
 # SECTION 15: SKILL.md is safe to load with arguments
 # ---------------------------------------------------------------------------
 #
-# Regression. Claude Code substitutes $0-$9 in a skill body with words from the
-# invocation arguments, so a bare positional is silently rewritten at load time.
+# Regression. Skill runners may substitute $0-$9 in a skill body with words from
+# invocation arguments, so a bare positional can be silently rewritten at load time.
 # SKILL.md previously embedded an awk price-join; invoking
 # "/domain-search find an available .com" turned `p[$1] = $2 "\t" $3` into
 # `p[an] = available "\t" .com`, and the documented pricing step was corrupt for
@@ -1708,6 +1778,23 @@ if [ -f "$SKILL_MD" ]; then
 	assert_eq "SKILL.md contains no \$<digit> (args would clobber it)" "" "$bad"
 	assert_contains "SKILL.md delegates the price-join to a script" \
 		"price-join.sh" "$(cat "$SKILL_MD")"
+	assert_contains "SKILL.md uses Claude's loaded skill directory" \
+		'${CLAUDE_SKILL_DIR}' "$(cat "$SKILL_MD")"
+	assert_contains "SKILL.md handles an unexpanded Claude directory under nounset" \
+		"CLAUDE_DS='\${CLAUDE_SKILL_DIR}'" "$(cat "$SKILL_MD")"
+	assert_contains "SKILL.md accepts Codex's loaded skill directory" \
+		'DOMAINSAVER_HOME' "$(cat "$SKILL_MD")"
+	resolver_order=$(awk '
+		/CODEX_HOME:-\$HOME\/.agents/ { current = NR }
+		/DS="\$HOME\/\.codex\/skills\/domain-search"/ { legacy = NR }
+		/CLAUDE_CONFIG_DIR:-\$HOME\/\.claude/ { claude = NR }
+		END {
+			print (current > 0 && legacy > current && claude > legacy) \
+				? "agent-first" : "wrong-order"
+		}
+	' "$SKILL_MD")
+	assert_eq "SKILL.md prefers current and legacy agent installs to a Claude fallback" \
+		"agent-first" "$resolver_order"
 else
 	skip "SKILL.md argument safety" "SKILL.md not found"
 fi
@@ -1721,6 +1808,135 @@ section "install.sh"
 SKILLS="$TMPDIR_T/skills"
 mkdir -p "$SKILLS"
 
+try bash "$DS_ROOT_DIR/install.sh" --help
+assert_rc "install.sh --help exits 0" 0 "$RC"
+assert_contains "install.sh --help is rendered from its usage block" \
+	"INSTALL:" "$OUT"
+assert_contains "install.sh --help documents the default target" \
+	"default: claude" "$OUT"
+assert_contains "install.sh --help documents both invocation forms" \
+	'Codex:        $domain-search' "$OUT"
+assert_contains "install.sh --help documents the Codex path override" \
+	"CODEX_HOME" "$OUT"
+assert_not_contains "install.sh does not claim slow RDAP registries require WHOIS" \
+	"all Identity Digital TLDs" "$(cat "$DS_ROOT_DIR/install.sh")"
+assert_contains "install.sh identifies representative no-RDAP dependencies" \
+	"no-RDAP TLDs such as .io, .co, .me and .de" "$(cat "$DS_ROOT_DIR/install.sh")"
+
+INSTALL_ALIAS="$TMPDIR_T/domainsaver-install"
+ln -s "$DS_ROOT_DIR/install.sh" "$INSTALL_ALIAS"
+try bash "$INSTALL_ALIAS" --help
+assert_rc "install.sh --help works through a renamed symlink" 0 "$RC"
+assert_contains "install.sh --help derives the invoked script name" \
+	"domainsaver-install - install the DomainSaver" "$OUT"
+
+try bash "$DS_ROOT_DIR/install.sh" --version
+assert_rc "install.sh --version exits 0" 0 "$RC"
+assert_contains "install.sh --version names itself" "install.sh 1.2.0" "$OUT"
+
+try bash "$DS_ROOT_DIR/install.sh" --target
+assert_rc "install.sh rejects --target without a value" 2 "$RC"
+assert_contains "install.sh usage errors include help" "OPTIONS:" "$ERR"
+
+try bash "$DS_ROOT_DIR/install.sh" --prefix
+assert_rc "install.sh rejects --prefix without a value" 2 "$RC"
+
+try env CODEX_HOME="$TMPDIR_T/codex-home" HOME="$TMPDIR_T/fake-home" \
+	bash "$DS_ROOT_DIR/install.sh" -t codex --dry-run
+assert_rc "install.sh accepts the legacy Codex location override" 0 "$RC"
+assert_contains "install.sh accepts the short target option" \
+	"target:  codex" "$OUT"
+assert_contains "install.sh honors CODEX_HOME/skills when explicitly set" \
+	"to:   $TMPDIR_T/codex-home/skills/domain-search" "$OUT"
+
+try env -u CODEX_HOME HOME="$TMPDIR_T/modern-codex-home" \
+	bash "$DS_ROOT_DIR/install.sh" --target=codex --dry-run
+assert_rc "install.sh accepts the current Codex location" 0 "$RC"
+assert_contains "install.sh accepts the equals target form" \
+	"target:  codex" "$OUT"
+assert_contains "install.sh defaults Codex to HOME/.agents/skills" \
+	"to:   $TMPDIR_T/modern-codex-home/.agents/skills/domain-search" "$OUT"
+
+LEGACY_HOME="$TMPDIR_T/legacy-codex-home"
+mkdir -p "$LEGACY_HOME/.codex/skills/domain-search"
+try env -u CODEX_HOME HOME="$LEGACY_HOME" \
+	bash "$DS_ROOT_DIR/install.sh" --target codex --force --dry-run
+assert_rc "install.sh accepts an existing legacy Codex installation" 0 "$RC"
+assert_contains "install.sh keeps updating an existing HOME/.codex skill" \
+	"to:   $LEGACY_HOME/.codex/skills/domain-search" "$OUT"
+
+try env CLAUDE_CONFIG_DIR="$TMPDIR_T/claude-config" HOME="$TMPDIR_T/fake-home" \
+	bash "$DS_ROOT_DIR/install.sh" --target claude --dry-run
+assert_rc "install.sh accepts the Claude Code location" 0 "$RC"
+assert_contains "install.sh honors CLAUDE_CONFIG_DIR/skills" \
+	"to:   $TMPDIR_T/claude-config/skills/domain-search" "$OUT"
+
+try env -u CLAUDE_CONFIG_DIR HOME="$TMPDIR_T/default-claude-home" \
+	bash "$DS_ROOT_DIR/install.sh" --dry-run
+assert_rc "install.sh defaults to Claude Code" 0 "$RC"
+assert_contains "the default target uses HOME/.claude/skills" \
+	"to:   $TMPDIR_T/default-claude-home/.claude/skills/domain-search" "$OUT"
+
+try bash "$DS_ROOT_DIR/install.sh" --target neither --dry-run
+assert_rc "install.sh rejects an unknown target" 2 "$RC"
+try bash "$DS_ROOT_DIR/install.sh" --target both --prefix "$SKILLS" --dry-run
+assert_rc "install.sh rejects one prefix for two targets" 2 "$RC"
+
+# Both destinations must be validated before either is changed. The second
+# target deliberately conflicts so these tests fail if processing starts with
+# Claude and only discovers the Codex problem after mutating Claude's install.
+PREFLIGHT_INSTALL_HOME="$TMPDIR_T/preflight-install-home"
+mkdir -p "$PREFLIGHT_INSTALL_HOME/.agents/skills/domain-search"
+printf 'keep me\n' >"$PREFLIGHT_INSTALL_HOME/.agents/skills/domain-search/user-file"
+try env -u CODEX_HOME -u CLAUDE_CONFIG_DIR HOME="$PREFLIGHT_INSTALL_HOME" \
+	bash "$DS_ROOT_DIR/install.sh" --target both -q
+assert_rc "install.sh preflights both install targets" 1 "$RC"
+if [ ! -e "$PREFLIGHT_INSTALL_HOME/.claude/skills/domain-search" ] && \
+	[ ! -h "$PREFLIGHT_INSTALL_HOME/.claude/skills/domain-search" ]; then
+	pass "a Codex install conflict leaves the Claude destination untouched"
+else
+	fail "a Codex install conflict leaves the Claude destination untouched" \
+		"the Claude target was created before Codex was validated"
+fi
+assert_file "preflight preserves the conflicting Codex directory" \
+	"$PREFLIGHT_INSTALL_HOME/.agents/skills/domain-search/user-file"
+
+PREFLIGHT_UNINSTALL_HOME="$TMPDIR_T/preflight-uninstall-home"
+mkdir -p "$PREFLIGHT_UNINSTALL_HOME/.claude/skills" \
+	"$PREFLIGHT_UNINSTALL_HOME/.agents/skills/domain-search"
+ln -s "$DS_ROOT_DIR" "$PREFLIGHT_UNINSTALL_HOME/.claude/skills/domain-search"
+printf 'keep me\n' >"$PREFLIGHT_UNINSTALL_HOME/.agents/skills/domain-search/user-file"
+try env -u CODEX_HOME -u CLAUDE_CONFIG_DIR HOME="$PREFLIGHT_UNINSTALL_HOME" \
+	bash "$DS_ROOT_DIR/install.sh" --target both --uninstall -q
+assert_rc "install.sh preflights both uninstall targets" 1 "$RC"
+if [ -L "$PREFLIGHT_UNINSTALL_HOME/.claude/skills/domain-search" ]; then
+	pass "a Codex uninstall conflict leaves the Claude install untouched"
+else
+	fail "a Codex uninstall conflict leaves the Claude install untouched" \
+		"the Claude link was removed before Codex was validated"
+fi
+
+DUAL_HOME="$TMPDIR_T/dual-home"
+mkdir -p "$DUAL_HOME"
+try env -u CODEX_HOME -u CLAUDE_CONFIG_DIR HOME="$DUAL_HOME" \
+	bash "$DS_ROOT_DIR/install.sh" --target both -q
+assert_rc "install.sh installs for Claude Code and Codex together" 0 "$RC"
+if [ -L "$DUAL_HOME/.claude/skills/domain-search" ] && \
+	[ -L "$DUAL_HOME/.agents/skills/domain-search" ]; then
+	pass "both targets link the shared skill directory"
+else
+	fail "both targets link the shared skill directory" "one or both host links are missing"
+fi
+assert_eq "the Claude link points at the checkout" "$DS_ROOT_DIR" \
+	"$(cd -P "$DUAL_HOME/.claude/skills/domain-search" 2>/dev/null && pwd)"
+assert_eq "the Codex link points at the checkout" "$DS_ROOT_DIR" \
+	"$(cd -P "$DUAL_HOME/.agents/skills/domain-search" 2>/dev/null && pwd)"
+try env -u CODEX_HOME -u CLAUDE_CONFIG_DIR HOME="$DUAL_HOME" \
+	bash "$DS_ROOT_DIR/install.sh" --target both --uninstall -q
+assert_rc "install.sh uninstalls both targets together" 0 "$RC"
+assert_eq "both target installs are removed" "0" \
+	"$(find "$DUAL_HOME" -type l -name domain-search | wc -l | tr -d ' ')"
+
 try bash "$DS_ROOT_DIR/install.sh" --prefix "$SKILLS" --dry-run
 assert_rc "install.sh --dry-run exits 0" 0 "$RC"
 assert_contains "install.sh --dry-run says what it would do" "would link" "$OUT"
@@ -1728,7 +1944,20 @@ assert_eq "install.sh --dry-run changes nothing" "" "$(ls -A "$SKILLS")"
 
 try bash "$DS_ROOT_DIR/install.sh" --prefix "$SKILLS" -q
 assert_rc "install.sh installs cleanly" 0 "$RC"
-assert_file "install.sh writes its marker file" "$SKILLS/domain-search/.domainsaver-install"
+if [ -L "$SKILLS/domain-search" ]; then
+	pass "install.sh links the whole skill directory for agent discovery"
+else
+	fail "install.sh links the whole skill directory for agent discovery" \
+		"the installed skill is not a directory symlink"
+fi
+assert_eq "the linked install points at the checkout" "$DS_ROOT_DIR" \
+	"$(cd -P "$SKILLS/domain-search" 2>/dev/null && pwd)"
+if [ ! -L "$SKILLS/domain-search/SKILL.md" ]; then
+	pass "install.sh leaves SKILL.md as a regular file for Codex discovery"
+else
+	fail "install.sh leaves SKILL.md as a regular file for Codex discovery" \
+		"SKILL.md is individually symlinked and Codex will skip it"
+fi
 for item in SKILL.md scripts wordlists; do
 	if [ -e "$SKILLS/domain-search/$item" ]; then
 		pass "install.sh installs $item"
@@ -1750,6 +1979,8 @@ assert_contains "and says --force is how you mean it" "--force" "$ERR"
 
 try bash "$DS_ROOT_DIR/install.sh" --prefix "$SKILLS" --copy --force -q
 assert_rc "install.sh --copy --force replaces an install" 0 "$RC"
+assert_file "install.sh writes its marker file for a snapshot" \
+	"$SKILLS/domain-search/.domainsaver-install"
 if [ -f "$SKILLS/domain-search/scripts/lib.sh" ] && [ ! -L "$SKILLS/domain-search/scripts" ]; then
 	pass "install.sh --copy takes a real snapshot, not a symlink"
 else
@@ -1759,6 +1990,96 @@ fi
 try bash "$DS_ROOT_DIR/install.sh" --prefix "$SKILLS" --uninstall -q
 assert_rc "install.sh --uninstall exits 0" 0 "$RC"
 assert_eq "install.sh --uninstall removes everything it installed" "" "$(ls -A "$SKILLS")"
+
+# Versions 1.0 and 1.1 used a real directory with links to each source item.
+# Keep that layout in the fixture so a whole-directory symlink cannot mask a
+# regression in marker validation.
+LEGACY_SOURCE="$TMPDIR_T/legacy-source"
+mkdir -p "$LEGACY_SOURCE/scripts"
+cp "$DS_ROOT_DIR/SKILL.md" "$LEGACY_SOURCE/SKILL.md"
+printf 'keep the checkout\n' >"$LEGACY_SOURCE/scripts/sentinel"
+
+# Build the on-disk layout written by the old symlink-mode installer.
+make_legacy_install() {
+	local dest version
+	dest="$1"
+	version="$2"
+	mkdir -p "$dest"
+	ln -s "$LEGACY_SOURCE/SKILL.md" "$dest/SKILL.md"
+	ln -s "$LEGACY_SOURCE/scripts" "$dest/scripts"
+	printf 'skill=domain-search\nsource=%s\nmode=symlink\ninstaller=%s\n' \
+		"$LEGACY_SOURCE" "$version" >"$dest/.domainsaver-install"
+}
+
+for legacy_version in 1.0.0 1.1.0; do
+	for upgrade_mode in symlink copy; do
+		LEGACY_SKILLS="$TMPDIR_T/legacy-$legacy_version-$upgrade_mode"
+		make_legacy_install "$LEGACY_SKILLS/domain-search" "$legacy_version"
+		try bash "$DS_ROOT_DIR/install.sh" --prefix "$LEGACY_SKILLS" -q
+		assert_rc "$legacy_version upgrade still requires explicit replacement" 1 "$RC"
+		assert_contains "$legacy_version symlink marker is recognised" \
+			"It looks like an existing DomainSaver install" "$ERR"
+		assert_file "refused $legacy_version upgrade preserves its marker" \
+			"$LEGACY_SKILLS/domain-search/.domainsaver-install"
+
+		try bash "$DS_ROOT_DIR/install.sh" --prefix "$LEGACY_SKILLS" "--$upgrade_mode" --force -q
+		assert_rc "$legacy_version upgrades to $upgrade_mode mode" 0 "$RC"
+		if [ "$upgrade_mode" = symlink ]; then
+			assert_eq "legacy upgrade links the whole skill to the current checkout" \
+				"$DS_ROOT_DIR" "$(readlink "$LEGACY_SKILLS/domain-search")"
+		else
+			assert_contains "legacy upgrade writes a copy marker" "mode=copy" \
+				"$(cat "$LEGACY_SKILLS/domain-search/.domainsaver-install")"
+		fi
+		assert_file "$legacy_version upgrade preserves the old source files" \
+			"$LEGACY_SOURCE/scripts/sentinel"
+	done
+
+	LEGACY_SKILLS="$TMPDIR_T/legacy-$legacy_version-uninstall"
+	make_legacy_install "$LEGACY_SKILLS/domain-search" "$legacy_version"
+	try bash "$DS_ROOT_DIR/install.sh" --prefix "$LEGACY_SKILLS" --uninstall -q
+	assert_rc "$legacy_version symlink install uninstalls without force" 0 "$RC"
+	assert_eq "$legacy_version uninstall removes the installation directory" \
+		"" "$(ls -A "$LEGACY_SKILLS")"
+	assert_file "$legacy_version uninstall preserves the linked source files" \
+		"$LEGACY_SOURCE/scripts/sentinel"
+	assert_file "$legacy_version uninstall preserves the linked skill" \
+		"$LEGACY_SOURCE/SKILL.md"
+done
+
+# Accepting legacy markers must not weaken ownership checks for other files.
+INVALID_SKILLS="$TMPDIR_T/invalid-marker-skills"
+mkdir -p "$INVALID_SKILLS/domain-search"
+printf 'keep me\n' >"$INVALID_SKILLS/domain-search/user-file"
+for invalid_marker in \
+	'mode=symlink' \
+	'skill=another-skill|mode=symlink' \
+	'skill=domain-search-extra|mode=symlink' \
+	'skill=domain-search' \
+	'skill=domain-search|mode=unknown' \
+	'skill=domain-search|mode=symlink-extra'; do
+	printf '%s\n' "$invalid_marker" | tr '|' '\n' \
+		>"$INVALID_SKILLS/domain-search/.domainsaver-install"
+	try bash "$DS_ROOT_DIR/install.sh" --prefix "$INVALID_SKILLS" --uninstall -q
+	assert_rc "uninstall rejects invalid marker: $invalid_marker" 1 "$RC"
+	assert_file "invalid marker leaves user files untouched: $invalid_marker" \
+		"$INVALID_SKILLS/domain-search/user-file"
+done
+
+# A skill name is public metadata, not an ownership marker. An unrelated real
+# directory must survive uninstall even if its SKILL.md uses the same name and
+# it contains a file with the install marker's filename.
+FOREIGN_SKILLS="$TMPDIR_T/foreign-skills"
+mkdir -p "$FOREIGN_SKILLS/domain-search"
+printf '%s\n' '---' 'name: domain-search' '---' >"$FOREIGN_SKILLS/domain-search/SKILL.md"
+printf 'not a DomainSaver marker\n' >"$FOREIGN_SKILLS/domain-search/.domainsaver-install"
+printf 'keep me\n' >"$FOREIGN_SKILLS/domain-search/user-file"
+try bash "$DS_ROOT_DIR/install.sh" --prefix "$FOREIGN_SKILLS" --uninstall -q
+assert_rc "install.sh refuses to uninstall an unmarked real directory" 1 "$RC"
+assert_file "uninstall preserves files it cannot prove it owns" \
+	"$FOREIGN_SKILLS/domain-search/user-file"
+assert_contains "uninstall explains the ownership check" \
+	"no valid .domainsaver-install marker" "$ERR"
 
 # ---------------------------------------------------------------------------
 # SECTION 16: bash 3.2 portability
